@@ -70,7 +70,8 @@ static readonly System.Text.RegularExpressions.Regex SchemeRx = new(@"^([a-zA-Z]
 public static string SafeUrl(string? url)
 {
     if (string.IsNullOrEmpty(url)) return url ?? "";
-    var norm = new string(url.Where(ch => ch > ' ' && ch != '\u007f').ToArray());
+    var norm = new string(WebUtility.HtmlDecode(url).Where(ch => ch > ' ' && ch != '\u007f').ToArray());
+    if (norm.StartsWith("//")) return url; // protocol-relative: same policy as http(s)
     var m = SchemeRx.Match(norm);
     if (!m.Success) return url; // relative or fragment
     var scheme = m.Groups[1].Value.ToLowerInvariant();
@@ -89,6 +90,8 @@ public static string RenderMd(string md)
     var doc = Markdown.Parse(rewritten, Pipe);
     foreach (var link in doc.Descendants<Markdig.Syntax.Inlines.LinkInline>())
         link.Url = SafeUrl(link.Url);
+    foreach (var auto in doc.Descendants<Markdig.Syntax.Inlines.AutolinkInline>())
+        auto.Url = SafeUrl(auto.Url);
     using var sw = new StringWriter();
     var renderer = new Markdig.Renderers.HtmlRenderer(sw);
     Pipe.Setup(renderer);

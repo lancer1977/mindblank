@@ -344,6 +344,31 @@ public class SecurityTests
         Assert.DoesNotContain("data:text", html, StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    [InlineData("<javascript:alert(1)>")]
+    [InlineData("<JaVaScRiPt:alert(1)>")]
+    [InlineData("<data:text/html,x>")]
+    public async Task Autolink_dangerous_schemes_are_neutralised(string md)
+    {
+        var html = await Render(md);
+        Assert.DoesNotContain("javascript:", html, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("data:", html, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Autolink_safe_schemes_are_kept()
+    {
+        var html = await Render("<https://example.com> <mailto:a@b.c>");
+        Assert.Contains("href=\"https://example.com\"", html);
+        Assert.Contains("href=\"mailto:a@b.c\"", html);
+    }
+
+    [Fact]
+    public void Protocol_relative_url_is_allowed()
+    {
+        Assert.Equal("//example.com/x", Helpers.SafeUrl("//example.com/x"));
+    }
+
     [Fact]
     public async Task Safe_urls_are_kept()
     {
