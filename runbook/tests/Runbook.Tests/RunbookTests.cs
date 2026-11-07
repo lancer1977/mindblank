@@ -268,4 +268,103 @@ public class ImportTests
         Assert.Equal(HttpStatusCode.RequestEntityTooLarge, r.StatusCode);
         Assert.False(File.Exists(e.Db));
     }
+
+    [Fact]
+    public async Task Right_tables_wrong_columns_is_400()
+    {
+        using var e = new Env();
+        var p = Path.Combine(e.Dir, "bad.db");
+        using (var c = new SqliteConnection($"Data Source={p};Pooling=False"))
+        {
+            c.Open();
+            foreach (var sql in new[] {
+                "CREATE TABLE meta(key TEXT, value TEXT)",
+                "INSERT INTO meta VALUES('schema_version','1')",
+                "CREATE TABLE notes(id INTEGER, foo TEXT)",
+                "CREATE VIRTUAL TABLE notes_fts USING fts5(a, b)" })
+            { using var m = c.CreateCommand(); m.CommandText = sql; m.ExecuteNonQuery(); }
+        }
+        var bytes = File.ReadAllBytes(p);
+        var r = await e.Client().SendAsync(Put(bytes, "sample-key"));
+        Assert.Equal(HttpStatusCode.BadRequest, r.StatusCode);
+        Assert.False(File.Exists(e.Db));
+    }
+
+    [Fact]
+    public void Stale_import_temp_files_are_swept_at_startup()
+    {
+        using var e = new Env();
+        var stale = Path.Combine(Path.GetDirectoryName(e.Db)!, ".import-deadbeef.tmp");
+        File.WriteAllText(stale, "partial");
+        e.Client();
+        Assert.False(File.Exists(stale));
+    }
+}
+
+public class SecurityTests
+{
+    static async Task<string> Render(string body)
+    {
+        using var e = new Env(withDb: false);
+        Directory.CreateDirectory(Path.GetDirectoryName(e.Db)!);
+        Sample.Build(e.Db);
+        using (var c = new SqliteConnection($"Data Source={e.Db};Pooling=False"))
+        {
+            c.Open();
+            using var m = c.CreateCommand();
+            m.CommandText = "UPDATE notes SET body_md=$b WHERE slug='plain-note'";
+            m.Parameters.AddWithValue("$b", body);
+            m.ExecuteNonQuery();
+        }
+        return await e.Client().GetStringAsync("/n/plain-note");
+    }
+
+    [Theory]
+    [InlineData("text {onmouseover=\"alert(1)\"}")]
+    [InlineData("# h {onclick=x}")]
+    [InlineData("[a](/x){onclick=x}")]
+    public async Task Generic_attributes_do_not_emit_event_handlers(string md)
+    {
+        var html = await Render(md);
+        // Literal text may remain visible, but no tag may carry an on* attribute.
+        Assert.DoesNotMatch(new System.Text.RegularExpressions.Regex(@"<[^>]*\son\w+\s*=", System.Text.RegularExpressions.RegexOptions.IgnoreCase), html);
+    }
+
+    [Theory]
+    [InlineData("[x](javascript:alert(1))")]
+    [InlineData("![i](javascript:alert(1))")]
+    [InlineData("[x](JaVaScRiPt:alert(1))")]
+    [InlineData("[x](data:text/html,hi)")]
+    [InlineData("[x](vbscript:msgbox(1))")]
+    public async Task Dangerous_url_schemes_are_neutralised(string md)
+    {
+        var html = await Render(md);
+        Assert.DoesNotContain("javascript:", html, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("vbscript:", html, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("data:text", html, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Safe_urls_are_kept()
+    {
+        var html = await Render("[a](https://example.com/x) [b](mailto:a@example.com) [c](/n/foo) [d](#frag)");
+        Assert.Contains("href=\"https://example.com/x\"", html);
+        Assert.Contains("href=\"mailto:a@example.com\"", html);
+        Assert.Contains("href=\"/n/foo\"", html);
+        Assert.Contains("href=\"#frag\"", html);
+    }
+
+    [Fact]
+    public async Task Security_headers_present_on_all_responses()
+    {
+        using var e = new Env();
+        foreach (var path in new[] { "/healthz", "/", "/nope" })
+        {
+            var r = await e.Client().GetAsync(path);
+            Assert.Equal("default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data: https:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                r.Headers.GetValues("Content-Security-Policy").Single());
+            Assert.Equal("nosniff", r.Headers.GetValues("X-Content-Type-Options").Single());
+            Assert.Equal("no-referrer", r.Headers.GetValues("Referrer-Policy").Single());
+        }
+    }
 }

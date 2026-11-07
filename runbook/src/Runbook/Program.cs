@@ -7,13 +7,31 @@ using Microsoft.Data.Sqlite;
 using static Helpers;
 
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = null);
 var app = builder.Build();
+
+app.Use(async (ctx, next) =>
+{
+    var h = ctx.Response.Headers;
+    h["Content-Security-Policy"] = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data: https:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+    h["X-Content-Type-Options"] = "nosniff";
+    h["Referrer-Policy"] = "no-referrer";
+    await next();
+});
 
 var cfg = app.Configuration;
 string DbPath() => cfg["RUNBOOK_DB_PATH"] is { Length: > 0 } p ? p : "/data/runbook.db";
 string KeyFile() => cfg["RUNBOOK_IMPORT_KEY_FILE"] is { Length: > 0 } p ? p : "/run/secrets/runbook_import_key";
 long MaxImport() => long.TryParse(cfg["RUNBOOK_MAX_IMPORT_BYTES"], out var n) && n > 0 ? n : 50L * 1024 * 1024;
+
+// Remove stale partial uploads left by a crash mid-import.
+try
+{
+    var startDir = Path.GetDirectoryName(Path.GetFullPath(DbPath()));
+    if (startDir != null && Directory.Exists(startDir))
+        foreach (var f in Directory.EnumerateFiles(startDir, ".import-*.tmp"))
+            try { File.Delete(f); } catch { }
+}
+catch { }
 
 app.MapGet("/healthz", () => Results.Text("ok"));
 
@@ -121,6 +139,8 @@ app.MapPut("/api/import", async (HttpRequest req) =>
 
     var max = MaxImport();
     if (req.ContentLength > max) return Results.StatusCode(413);
+    var sizeFeature = req.HttpContext.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature>();
+    if (sizeFeature is { IsReadOnly: false }) sizeFeature.MaxRequestBodySize = max;
 
     var dbPath = Path.GetFullPath(DbPath());
     var dir = Path.GetDirectoryName(dbPath)!;
@@ -147,6 +167,7 @@ app.MapPut("/api/import", async (HttpRequest req) =>
         File.Move(tmp, dbPath, overwrite: true);
         return Results.Json(new { notes = count });
     }
+    catch (Microsoft.AspNetCore.Http.BadHttpRequestException ex) when (ex.StatusCode == 413) { return Results.StatusCode(413); }
     finally { try { File.Delete(tmp); } catch { } }
 });
 

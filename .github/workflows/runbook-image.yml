@@ -50,9 +50,12 @@ jobs:
             if [ "$out" = "ok" ]; then ok=1; break; fi
             sleep 1
           done
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary 'x' http://localhost:8080/api/import || true)
           docker logs runbook-smoke || true
           docker rm -f runbook-smoke >/dev/null
           test -n "$ok"
+          # No import key file mounted: import must be disabled (503), not open.
+          test "$code" = "503"
       - name: Push image
         uses: docker/build-push-action@v6
         with:

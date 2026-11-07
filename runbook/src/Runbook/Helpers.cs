@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using Markdig;
+using Markdig.Syntax;
 using Microsoft.Data.Sqlite;
 
 public static class Helpers
@@ -13,7 +14,9 @@ public static int Validate(string path)
     string Scalar(string sql) { using var m = c.CreateCommand(); m.CommandText = sql; return Convert.ToString(m.ExecuteScalar()) ?? ""; }
     if (Scalar("PRAGMA integrity_check") != "ok") throw new InvalidDataException("integrity");
     if (Scalar("SELECT value FROM meta WHERE key='schema_version'") != "1") throw new InvalidDataException("schema_version");
-    if (Scalar("SELECT count(*) FROM sqlite_master WHERE name IN ('notes','notes_fts')") != "2") throw new InvalidDataException("tables");
+    if (Scalar("SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('notes','notes_fts')") != "2") throw new InvalidDataException("tables");
+    Scalar("SELECT slug,title,category,tags,description,body_md,source_path,updated_utc FROM notes LIMIT 1");
+    Scalar("SELECT rowid FROM notes_fts WHERE notes_fts MATCH '\"x\"' LIMIT 1");
     return int.Parse(Scalar("SELECT count(*) FROM notes"));
 }
 
@@ -52,7 +55,27 @@ public static string Slugify(string s)
     return sb.ToString();
 }
 
-public static readonly MarkdownPipeline Pipe = new MarkdownPipelineBuilder().UseAdvancedExtensions().DisableHtml().Build();
+public static readonly MarkdownPipeline Pipe = BuildPipe();
+
+static MarkdownPipeline BuildPipe()
+{
+    var b = new MarkdownPipelineBuilder().UseAdvancedExtensions().DisableHtml();
+    // GenericAttributes would let note text inject arbitrary attributes such as onclick.
+    b.Extensions.RemoveAll(e => e is Markdig.Extensions.GenericAttributes.GenericAttributesExtension);
+    return b.Build();
+}
+
+static readonly System.Text.RegularExpressions.Regex SchemeRx = new(@"^([a-zA-Z][a-zA-Z0-9+.\-]*):", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+public static string SafeUrl(string? url)
+{
+    if (string.IsNullOrEmpty(url)) return url ?? "";
+    var norm = new string(url.Where(ch => ch > ' ' && ch != '\u007f').ToArray());
+    var m = SchemeRx.Match(norm);
+    if (!m.Success) return url; // relative or fragment
+    var scheme = m.Groups[1].Value.ToLowerInvariant();
+    return scheme is "http" or "https" or "mailto" ? url : "#";
+}
 public static readonly System.Text.RegularExpressions.Regex Wiki = new(@"\[\[([^\]\|\r\n]+)(?:\|([^\]\r\n]+))?\]\]", System.Text.RegularExpressions.RegexOptions.Compiled);
 
 public static string RenderMd(string md)
@@ -63,7 +86,14 @@ public static string RenderMd(string md)
         var label = m.Groups[2].Success ? m.Groups[2].Value.Trim() : target;
         return $"[{label}](/n/{Slugify(target)})";
     });
-    return Markdown.ToHtml(rewritten, Pipe);
+    var doc = Markdown.Parse(rewritten, Pipe);
+    foreach (var link in doc.Descendants<Markdig.Syntax.Inlines.LinkInline>())
+        link.Url = SafeUrl(link.Url);
+    using var sw = new StringWriter();
+    var renderer = new Markdig.Renderers.HtmlRenderer(sw);
+    Pipe.Setup(renderer);
+    renderer.Render(doc);
+    return sw.ToString();
 }
 
 public static IResult NotFoundPage() =>
