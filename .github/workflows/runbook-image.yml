@@ -1,0 +1,65 @@
+name: Runbook image
+
+on:
+  push:
+    branches: [main]
+    paths: ["runbook/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/lancer1977/mindblank-runbook
+
+jobs:
+  image:
+    name: Build, smoke and push runbook image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=main
+            type=raw,value=latest
+            type=sha,format=short,prefix=sha-
+      - name: Build local image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: runbook
+          load: true
+          push: false
+          tags: runbook-smoke:test
+      - name: Smoke test /healthz
+        run: |
+          docker run -d --name runbook-smoke -p 8080:8080 runbook-smoke:test
+          ok=""
+          for i in $(seq 1 30); do
+            out=$(curl -fsS http://localhost:8080/healthz 2>/dev/null || true)
+            if [ "$out" = "ok" ]; then ok=1; break; fi
+            sleep 1
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary 'x' http://localhost:8080/api/import || true)
+          docker logs runbook-smoke || true
+          docker rm -f runbook-smoke >/dev/null
+          test -n "$ok"
+          # No import key file mounted: import must be disabled (503), not open.
+          test "$code" = "503"
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: runbook
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
