@@ -8,10 +8,17 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import io
+import json
+import os
 import shutil
+import socket
+import sqlite3
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "sync-from-vault.py"
@@ -348,6 +355,336 @@ class SafetyTests(SyncTestCase):
             code = sync.run(["--vault", str(missing), "--content", str(self.content)])
         self.assertNotEqual(code, 0)
         self.assertTrue(stale.exists(), "a missing vault must never prune content")
+
+
+IMPORT_KEY = "sample-import-key-0123456789"
+IMPORT_KEY_HEADER = "X-Runbook-Import-Key"
+SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+class PrivateTestCase(SyncTestCase):
+    """Fixtures for the --audience private path. Invented sample notes only."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.db = Path(self._tmp.name) / "out" / "runbook.db"
+        self.key_file = Path(self._tmp.name) / "import.key"
+
+    def pnote(self, folder: str, name: str, body: str, *, marker: str = "mindblank: private", extra=()) -> Path:
+        rel = f"{folder}/{name}.md" if folder else f"{name}.md"
+        text = "\n".join(["---", marker, *extra, "---", ""]) + "\n" + body + "\n"
+        return self.write(rel, text)
+
+    def run_private(self, *args: str) -> tuple[int, str, str]:
+        return self.run_sync("--audience", "private", "--db", str(self.db), *args)
+
+    def read_db(self) -> sqlite3.Connection:
+        return sqlite3.connect(str(self.db))
+
+    def db_slugs(self) -> list[str]:
+        with contextlib.closing(self.read_db()) as con:
+            return [row[0] for row in con.execute("SELECT slug FROM notes ORDER BY slug")]
+
+    def tmp_leftovers(self) -> list[str]:
+        return [n for n in os.listdir(self.db.parent) if n != "runbook.db"]
+
+
+class PrivateSelectionTests(PrivateTestCase):
+    def test_public_excludes_private_notes(self) -> None:
+        self.note("Gaming PC", "Pub", "public body")
+        self.pnote("Gaming PC", "Priv", "private body")
+        code, _out, _err = self.run_sync()
+        self.assertEqual(code, 0)
+        self.assertTrue((self.content / "gaming-pc" / "Pub.md").is_file())
+        self.assertFalse((self.content / "gaming-pc" / "Priv.md").exists())
+        self.assertFalse(self.db.exists(), "public audience never writes runbook.db")
+
+    def test_private_selects_only_private_notes(self) -> None:
+        self.note("Gaming PC", "Pub", "public body")
+        self.pnote("Gaming PC", "Priv", "private body", extra=("title: Priv",))
+        self.note("Gaming PC", "Legacy", "legacy", extra="publish: true", opted_in=False)
+        self.write("Gaming PC/Bare.md", "no frontmatter at all\n")
+        code, out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/priv"])
+        self.assertEqual(self.content_files(), [], "private audience must not write content/")
+        self.assertIn("wrote", out)
+
+    def test_private_accepts_quoted_marker(self) -> None:
+        self.pnote("Gaming PC", "Dq", "one", marker='mindblank: "private"')
+        self.pnote("Gaming PC", "Sq", "two", marker="mindblank: 'private'")
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/dq", "gaming-pc/sq"])
+
+    def test_private_note_with_mindblank_true_is_not_private(self) -> None:
+        self.note("Gaming PC", "Public Only", "body")
+        code, _out, _err = self.run_private()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.db_slugs(), [])
+
+    def test_note_with_both_markers_is_private_only(self) -> None:
+        self.pnote("Gaming PC", "Both", "body", extra=("mindblank: true",))
+        code, _out, _err = self.run_sync()
+        self.assertEqual(code, 0)
+        self.assertFalse((self.content / "gaming-pc" / "Both.md").exists())
+        code, _out, _err = self.run_private()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/both"])
+
+    def test_secret_in_private_note_aborts_and_writes_no_db(self) -> None:
+        self.pnote("Gaming PC", "Leaky", "connect: postgres://user:hunter2pass@db:5432/x")
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 2)
+        self.assertIn("REFUSING", err)
+        self.assertNotIn("hunter2pass", err)
+        self.assertFalse(self.db.exists())
+        self.assertEqual(self.tmp_leftovers() if self.db.parent.exists() else [], [])
+        self.assertEqual(self.content_files(), [])
+
+    def test_secret_in_private_attachment_aborts(self) -> None:
+        self.write("Gaming PC/diagram.svg", "<svg><text>password=hunter2hunter2</text></svg>")
+        self.pnote("Gaming PC", "Diagram", "![[diagram.svg]]")
+        code, _out, _err = self.run_private()
+        self.assertEqual(code, 2)
+        self.assertFalse(self.db.exists())
+
+    def test_slug_collision_in_private_aborts(self) -> None:
+        self.pnote("A B", "Same", "one")
+        self.pnote("a-b", "Same", "two")
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 2)
+        self.assertIn("collision", err.lower())
+        self.assertFalse(self.db.exists())
+
+    def test_dry_run_private_writes_nothing(self) -> None:
+        self.pnote("Gaming PC", "Dry", "body")
+        code, out, _err = self.run_private("--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("index    gaming-pc/dry", out)
+        self.assertFalse(self.db.exists())
+        self.assertFalse(self.db.parent.exists())
+
+    def test_existing_db_is_replaced_fresh(self) -> None:
+        self.db.parent.mkdir(parents=True)
+        self.db.write_bytes(b"this is not a database")
+        self.pnote("Gaming PC", "Only", "body")
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/only"])
+        self.assertEqual(self.tmp_leftovers(), [])
+
+
+class PrivateDbTests(PrivateTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.pnote(
+            "Gaming PC",
+            "Battle Net",
+            "# Battle.net setup\n\nInstall the launcher and sign in with the sample account.",
+            extra=("tags: [launcher, \"game store\"]", "description: Sample description text"),
+        )
+        self.pnote("Gaming PC", "Other", "Unrelated content about zebras.", extra=("title: Other note",))
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+
+    def test_schema_matches_contract(self) -> None:
+        with contextlib.closing(self.read_db()) as con:
+            names = {row[0] for row in con.execute("SELECT name FROM sqlite_master")}
+            self.assertTrue({"meta", "notes", "notes_fts"} <= names)
+            cols = [row[1] for row in con.execute("PRAGMA table_info(notes)")]
+            self.assertEqual(
+                cols, ["slug", "title", "category", "tags", "description", "body_md", "source_path", "updated_utc"]
+            )
+            self.assertEqual(con.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+
+    def test_meta_rows(self) -> None:
+        with contextlib.closing(self.read_db()) as con:
+            meta = dict(con.execute("SELECT key, value FROM meta"))
+        self.assertEqual(meta["schema_version"], "1")
+        self.assertEqual(meta["note_count"], "2")
+        self.assertRegex(meta["generated_utc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_row_fields(self) -> None:
+        with contextlib.closing(self.read_db()) as con:
+            row = con.execute(
+                "SELECT title, category, tags, description, body_md, source_path, updated_utc "
+                "FROM notes WHERE slug = 'gaming-pc/battle-net'"
+            ).fetchone()
+        title, category, tags, description, body, source_path, updated = row
+        self.assertEqual(title, "Battle.net setup", "title falls back to the first '# ' heading")
+        self.assertEqual(category, "gaming-pc")
+        self.assertEqual(json.loads(tags), ["launcher", "game store"])
+        self.assertEqual(description, "Sample description text")
+        self.assertNotIn("mindblank:", body, "body_md must exclude frontmatter")
+        self.assertTrue(body.lstrip().startswith("# Battle.net setup"))
+        self.assertEqual(source_path, "Gaming PC/Battle Net.md")
+        self.assertRegex(updated, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_fts_search_finds_body_and_title(self) -> None:
+        with contextlib.closing(self.read_db()) as con:
+            query = "SELECT n.slug FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid WHERE notes_fts MATCH ?"
+            hits = [r[0] for r in con.execute(query, ("launcher",))]
+            self.assertEqual(hits, ["gaming-pc/battle-net"])
+            hits = [r[0] for r in con.execute(query, ("zebras",))]
+            self.assertEqual(hits, ["gaming-pc/other"])
+
+    def test_root_note_slug_and_category(self) -> None:
+        self.pnote("", "Loose Note", "body without heading or title")
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        with contextlib.closing(self.read_db()) as con:
+            row = con.execute("SELECT slug, category, title FROM notes WHERE slug = 'loose-note'").fetchone()
+        self.assertEqual(row, ("loose-note", "notes", "Loose Note"))
+
+    def test_slug_normalisation(self) -> None:
+        self.pnote("Gaming PC", "Battle Net v2!", "body", extra=("title: Battle v2",))
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertIn("gaming-pc/battle-net-v2", self.db_slugs())
+
+    def test_tags_comma_string_and_block_list(self) -> None:
+        self.pnote("Gaming PC", "Commas", "body", extra=("tags: alpha, beta",))
+        self.pnote("Gaming PC", "Block", "body", extra=("tags:", "  - gamma", "  - delta"))
+        self.pnote("Gaming PC", "NoTags", "body")
+        code, _out, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        with contextlib.closing(self.read_db()) as con:
+            tags = dict(con.execute("SELECT slug, tags FROM notes"))
+        self.assertEqual(json.loads(tags["gaming-pc/commas"]), ["alpha", "beta"])
+        self.assertEqual(json.loads(tags["gaming-pc/block"]), ["gamma", "delta"])
+        self.assertEqual(json.loads(tags["gaming-pc/notags"]), [])
+
+
+class PrivateArgumentTests(PrivateTestCase):
+    def test_missing_db_with_private_errors(self) -> None:
+        self.pnote("Gaming PC", "Priv", "body")
+        code, _out, err = self.run_sync("--audience", "private")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--db", err)
+        self.assertEqual(self.content_files(), [])
+
+    def test_db_flags_rejected_for_public(self) -> None:
+        code, _out, err = self.run_sync("--db", str(self.db))
+        self.assertNotEqual(code, 0)
+        self.assertIn("--audience private", err)
+        self.assertFalse(self.db.exists())
+
+    def test_key_file_requires_upload(self) -> None:
+        code, _out, _err = self.run_private("--key-file", str(self.key_file))
+        self.assertNotEqual(code, 0)
+
+    def test_upload_without_any_key_errors_before_writing(self) -> None:
+        self.pnote("Gaming PC", "Priv", "body")
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("RUNBOOK_IMPORT_KEY", None)
+            code, _out, err = self.run_private("--upload", "http://127.0.0.1:9")
+        self.assertNotEqual(code, 0)
+        self.assertIn("RUNBOOK_IMPORT_KEY", err)
+        self.assertFalse(self.db.exists(), "no key means nothing is written")
+
+    def test_upload_rejects_non_http_scheme(self) -> None:
+        self.pnote("Gaming PC", "Priv", "body")
+        self.key_file.write_text(IMPORT_KEY + "\n", encoding="utf-8")
+        code, _out, _err = self.run_private("--upload", "file:///etc/passwd", "--key-file", str(self.key_file))
+        self.assertNotEqual(code, 0)
+        self.assertFalse(self.db.exists())
+
+
+class _UploadServer:
+    """Local http.server test double that records every request it receives."""
+
+    def __init__(self, status: int = 200) -> None:
+        self.requests: list[dict] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_PUT(self) -> None:  # noqa: N802 - http.server hook
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length)
+                outer.requests.append(
+                    {
+                        "method": "PUT",
+                        "path": self.path,
+                        "key": self.headers.get(IMPORT_KEY_HEADER),
+                        "body": body,
+                    }
+                )
+                payload = b'{"notes": 1}' if 200 <= status < 300 else b'{"error": "unauthorized"}'
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args) -> None:  # silence the default stderr access log
+                return
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class PrivateUploadTests(PrivateTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.pnote("Gaming PC", "Priv", "body text for upload")
+        self.key_file.write_text(IMPORT_KEY + "\n", encoding="utf-8")
+
+    def start(self, status: int = 200) -> _UploadServer:
+        server = _UploadServer(status)
+        self.addCleanup(server.close)
+        return server
+
+    def test_upload_puts_db_with_key_header(self) -> None:
+        server = self.start()
+        code, out, err = self.run_private("--upload", server.url, "--key-file", str(self.key_file))
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(len(server.requests), 1)
+        req = server.requests[0]
+        self.assertEqual(req["method"], "PUT")
+        self.assertEqual(req["path"], "/api/import")
+        self.assertEqual(req["key"], IMPORT_KEY)
+        self.assertTrue(req["body"].startswith(SQLITE_MAGIC))
+        self.assertEqual(req["body"], self.db.read_bytes())
+        self.assertNotIn(IMPORT_KEY, out)
+        self.assertNotIn(IMPORT_KEY, err)
+
+    def test_upload_key_from_env(self) -> None:
+        server = self.start()
+        with mock.patch.dict(os.environ, {"RUNBOOK_IMPORT_KEY": IMPORT_KEY}):
+            code, out, err = self.run_private("--upload", server.url)
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(server.requests[0]["key"], IMPORT_KEY)
+        self.assertNotIn(IMPORT_KEY, out + err)
+
+    def test_upload_non_2xx_exits_nonzero(self) -> None:
+        server = self.start(status=401)
+        code, out, err = self.run_private("--upload", server.url, "--key-file", str(self.key_file))
+        self.assertNotEqual(code, 0)
+        self.assertIn("401", err)
+        self.assertNotIn(IMPORT_KEY, out + err)
+        self.assertTrue(self.db.exists(), "the local db is still written before upload")
+
+    def test_upload_unreachable_exits_nonzero(self) -> None:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        code, out, err = self.run_private("--upload", f"http://127.0.0.1:{port}", "--key-file", str(self.key_file))
+        self.assertNotEqual(code, 0)
+        self.assertNotIn(IMPORT_KEY, out + err)
+
+    def test_dry_run_upload_sends_nothing(self) -> None:
+        server = self.start()
+        code, _out, _err = self.run_private("--dry-run", "--upload", server.url, "--key-file", str(self.key_file))
+        self.assertEqual(code, 0)
+        self.assertEqual(server.requests, [])
+        self.assertFalse(self.db.exists())
 
 
 if __name__ == "__main__":

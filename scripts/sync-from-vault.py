@@ -6,21 +6,39 @@ vault's older `publish: true` flag (800+ legacy reference notes, some holding
 credentials) is deliberately NOT the opt-in. Copies get `publish: true` added
 so Quartz's ExplicitPublish filter accepts them.
 
-Fail-closed guard: every published note and every embedded attachment is
+Private audience (--audience private): notes with `mindblank: private` (quoted
+or not) are written to a runbook.db SQLite file at --db instead of content/.
+Nothing is written to content/ in that mode. --upload URL then PUTs the db to
+URL/api/import with the key from RUNBOOK_IMPORT_KEY or --key-file.
+
+Fail-closed guard: every selected note and every embedded attachment is
 scanned for credential-shaped strings, and the whole sync aborts (exit 2)
-before anything is written if one is found. Output-path collisions abort too.
-Published notes that wikilink to un-opted-in vault notes print a WARN line
-(or abort with --strict).
+before anything is written if one is found. This runs identically for both
+audiences. Output-path collisions abort too. Public notes that wikilink to
+un-opted-in vault notes print a WARN line (or abort with --strict).
 
 Usage: scripts/sync-from-vault.py [--vault ~/vaults/polyhydra] [--content DIR]
                                   [--dry-run] [--strict]
+       scripts/sync-from-vault.py --audience private --db PATH
+                                  [--vault ~/vaults/polyhydra] [--dry-run]
+                                  [--upload URL [--key-file PATH]]
 """
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import sqlite3
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_CONTENT = REPO / "content"
@@ -28,12 +46,35 @@ KEEP = {"index.md"}  # owned by this repo, never overwritten or pruned
 SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "90_Archive", "99_Scratch"}
 ATTACH_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".pdf"}
 ENV_KEYWORDS = ("PASS", "PWD", "SECRET", "TOKEN", "KEY")
+AUDIENCES = ("public", "private")
+ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
+IMPORT_KEY_HEADER = "X-Runbook-Import-Key"
+IMPORT_PATH = "/api/import"
+IMPORT_KEY_ENV = "RUNBOOK_IMPORT_KEY"
 
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
 PUBLISH = re.compile(r"^mindblank:\s*(true|yes)\s*$", re.M | re.I)
+PRIVATE = re.compile(r"^mindblank:[ \t]*([\"']?)private\1[ \t]*$", re.M | re.I)
 QUARTZ_PUBLISH = re.compile(r"^publish:\s*true\s*$", re.M | re.I)
 EMBED = re.compile(r"!\[\[([^\]|#]+)")
 WIKILINK = re.compile(r"!?\[\[([^\]|#^\n]+)")
+H1 = re.compile(r"^#[ \t]+(.+?)[ \t]*$", re.M)
+SLUG_DROP = re.compile(r"[^a-z0-9/-]")
+
+DB_DDL = """
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE notes(
+  slug TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  category TEXT NOT NULL,
+  tags TEXT NOT NULL DEFAULT '[]',
+  description TEXT,
+  body_md TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  updated_utc TEXT NOT NULL
+);
+CREATE VIRTUAL TABLE notes_fts USING fts5(title, description, body_md, content='notes', content_rowid='rowid');
+"""
 
 # Values that are obviously placeholders, not secrets. Matched against the
 # captured secret value only, so `password: <your-password>` stays quiet.
@@ -108,9 +149,24 @@ SECRET_RULES = [
 ]
 
 
-def is_published(text: str) -> bool:
+def audience_of(text: str) -> str | None:
+    """Which audience a note opts into, or None.
+
+    Private is checked first, so a note carrying both markers can only be
+    selected for private and never leaks into the public content/ tree.
+    """
     m = FRONTMATTER.match(text)
-    return bool(m and PUBLISH.search(m.group(1)))
+    if not m:
+        return None
+    if PRIVATE.search(m.group(1)):
+        return "private"
+    if PUBLISH.search(m.group(1)):
+        return "public"
+    return None
+
+
+def is_published(text: str) -> bool:
+    return audience_of(text) == "public"
 
 
 def scan(where: str, text: str) -> list[str]:
@@ -141,6 +197,14 @@ def note_rel(vault: Path, p: Path) -> Path:
     return Path(slug) / p.name
 
 
+def slug_for(vault: Path, p: Path) -> str:
+    """Vault-relative path without .md, lowercased, spaces to '-', other chars removed."""
+    rel = p.relative_to(vault).as_posix()
+    if rel.endswith(".md"):
+        rel = rel[:-3]
+    return SLUG_DROP.sub("", rel.lower().replace(" ", "-"))
+
+
 PUBLISH_KEY = re.compile(r"publish\s*:", re.I)
 
 
@@ -163,7 +227,230 @@ def render_note(text: str) -> str:
     return text[: first_nl + 1] + block + eol + text[fm.end(1) + 1 :]
 
 
-def sync(vault: Path, content: Path, *, dry_run: bool = False, strict: bool = False) -> int:
+# ---------------------------------------------------------------------------
+# Private audience: frontmatter fields, runbook.db writer, upload.
+# ---------------------------------------------------------------------------
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def fm_scalar(fm_text: str, key: str) -> str | None:
+    pat = re.compile(rf"^{re.escape(key)}[ \t]*:[ \t]*(.*?)[ \t\r]*$", re.I)
+    for line in fm_text.split("\n"):
+        m = pat.match(line)
+        if m:
+            return _unquote(m.group(1)) or None
+    return None
+
+
+def fm_list(fm_text: str, key: str) -> list[str]:
+    """Frontmatter list as strings: inline `[a, b]`, comma string, or block `- item` lines."""
+    lines = [line.rstrip("\r") for line in fm_text.split("\n")]
+    pat = re.compile(rf"^{re.escape(key)}[ \t]*:[ \t]*(.*?)[ \t]*$", re.I)
+    for i, line in enumerate(lines):
+        m = pat.match(line)
+        if not m:
+            continue
+        raw = m.group(1)
+        if raw.startswith("["):
+            items = raw[1:].rsplit("]", 1)[0].split(",")
+        elif raw:
+            items = raw.split(",")
+        else:
+            items = []
+            for nxt in lines[i + 1 :]:
+                bm = re.match(r"^[ \t]+-[ \t]*(.*?)[ \t]*$", nxt)
+                if not bm:
+                    break
+                items.append(bm.group(1))
+        out: list[str] = []
+        for item in items:
+            value = _unquote(item)
+            if value and value not in out:
+                out.append(value)
+        return out
+    return []
+
+
+def note_body(text: str) -> str:
+    fm = FRONTMATTER.match(text)
+    return text[fm.end() :] if fm else text
+
+
+class NoteRecord(NamedTuple):
+    slug: str
+    title: str
+    category: str
+    tags: list[str]
+    description: str | None
+    body_md: str
+    source_path: str
+    updated_utc: str
+
+
+def build_record(vault: Path, p: Path, text: str) -> NoteRecord:
+    fm = FRONTMATTER.match(text)
+    fm_text = fm.group(1) if fm else ""
+    body = note_body(text)
+    slug = slug_for(vault, p)
+    title = fm_scalar(fm_text, "title")
+    if not title:
+        heading = H1.search(body)
+        title = heading.group(1) if heading else p.stem
+    category = slug.split("/", 1)[0] if "/" in slug else "notes"
+    return NoteRecord(
+        slug=slug,
+        title=title,
+        category=category,
+        tags=fm_list(fm_text, "tags"),
+        description=fm_scalar(fm_text, "description"),
+        body_md=body,
+        source_path=p.relative_to(vault).as_posix(),
+        updated_utc=utc_iso(p.stat().st_mtime),
+    )
+
+
+def utc_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(ISO_UTC)
+
+
+def write_runbook_db(db: Path, records: list[NoteRecord], generated_utc: str) -> None:
+    """Write a fresh runbook.db (schema_version 1) to a temp file beside db, then os.replace it."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".runbook-", suffix=".tmp", dir=db.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        con = sqlite3.connect(tmp)
+        try:
+            con.executescript(DB_DDL)
+            con.executemany(
+                "INSERT INTO meta(key, value) VALUES (?, ?)",
+                [
+                    ("schema_version", "1"),
+                    ("generated_utc", generated_utc),
+                    ("note_count", str(len(records))),
+                ],
+            )
+            con.executemany(
+                "INSERT INTO notes(slug, title, category, tags, description, body_md, source_path, updated_utc) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        r.slug,
+                        r.title,
+                        r.category,
+                        json.dumps(r.tags, ensure_ascii=False),
+                        r.description,
+                        r.body_md,
+                        r.source_path,
+                        r.updated_utc,
+                    )
+                    for r in records
+                ],
+            )
+            con.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
+            con.commit()
+        finally:
+            con.close()
+        os.replace(tmp, db)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects so the import key is never re-sent to another host."""
+
+    def redirect_request(self, *args, **kwargs):  # noqa: D401 - urllib hook
+        return None
+
+
+def upload_db(db: Path, base_url: str, import_key: str) -> int:
+    target = base_url.rstrip("/")
+    if not target.endswith(IMPORT_PATH):
+        target += IMPORT_PATH
+    req = urllib.request.Request(
+        target,
+        data=db.read_bytes(),
+        method="PUT",
+        headers={IMPORT_KEY_HEADER: import_key, "Content-Type": "application/vnd.sqlite3"},
+    )
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=120) as resp:
+            status = resp.getcode()
+    except urllib.error.HTTPError as exc:
+        print(f"error: upload to {target} failed: HTTP {exc.code}", file=sys.stderr)
+        return 3
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"error: upload to {target} failed: {getattr(exc, 'reason', exc)}", file=sys.stderr)
+        return 3
+    if not 200 <= status < 300:
+        print(f"error: upload to {target} failed: HTTP {status}", file=sys.stderr)
+        return 3
+    print(f"uploaded {db.name} to {target} (HTTP {status})")
+    return 0
+
+
+def load_import_key(key_file: str | None) -> str | None:
+    if key_file:
+        raw = Path(key_file).expanduser().read_text(encoding="utf-8")
+    else:
+        raw = os.environ.get(IMPORT_KEY_ENV)
+    return (raw or "").strip() or None
+
+
+def _write_private(
+    vault: Path,
+    published: set[Path],
+    md_texts: dict[Path, str],
+    *,
+    db: Path,
+    dry_run: bool,
+    upload_url: str | None,
+    import_key: str | None,
+) -> int:
+    records = [build_record(vault, p, md_texts[p]) for p in sorted(published, key=lambda p: slug_for(vault, p))]
+    for r in records:
+        print(f"index    {r.slug}")
+    if dry_run:
+        print(f"{len(records)} note(s) would be written to {db} (dry run)")
+        return 0
+    write_runbook_db(db, records, utc_iso(time.time()))
+    print(f"wrote    {db} ({len(records)} note(s))")
+    if upload_url is None:
+        return 0
+    if import_key is None:
+        raise ValueError("upload requested without an import key")
+    return upload_db(db, upload_url, import_key)
+
+
+# ---------------------------------------------------------------------------
+# Sync driver
+# ---------------------------------------------------------------------------
+
+
+def sync(
+    vault: Path,
+    content: Path,
+    *,
+    dry_run: bool = False,
+    strict: bool = False,
+    audience: str = "public",
+    db: Path | None = None,
+    upload_url: str | None = None,
+    import_key: str | None = None,
+) -> int:
+    if audience not in AUDIENCES:
+        raise ValueError(f"unknown audience: {audience!r}")
+    if audience == "private" and db is None:
+        raise ValueError("audience private requires a db path")
     if not vault.is_dir():
         # Checked before anything else so a missing vault can never prune content.
         print(f"error: vault not found: {vault}", file=sys.stderr)
@@ -172,7 +459,7 @@ def sync(vault: Path, content: Path, *, dry_run: bool = False, strict: bool = Fa
 
     files = [p for p in walk(vault) if p.is_file()]
     md_texts = {p: p.read_bytes().decode("utf-8", errors="replace") for p in files if p.suffix == ".md"}
-    published = {p for p, text in md_texts.items() if is_published(text)}
+    published = {p for p, text in md_texts.items() if audience_of(text) == audience}
 
     attachments_by_name: dict[str, list[Path]] = {}
     for p in files:
@@ -183,7 +470,7 @@ def sync(vault: Path, content: Path, *, dry_run: bool = False, strict: bool = Fa
     for p in md_texts:
         stems.setdefault(p.stem.casefold(), []).append(p)
 
-    outputs: dict[Path, Path] = {}  # public relative path -> source file
+    outputs: dict[Path, Path] = {}  # output relative path -> source file
     problems: list[str] = []
     warnings: list[str] = []
 
@@ -201,20 +488,28 @@ def sync(vault: Path, content: Path, *, dry_run: bool = False, strict: bool = Fa
         text = md_texts[p]
         where = p.relative_to(vault).as_posix()
         problems.extend(scan(where, text))
-        claim(note_rel(vault, p), p)
 
-        for raw in WIKILINK.findall(text):
-            target = raw.strip()
-            if not target or Path(target).suffix.lower() in ATTACH_EXT:
-                continue
-            base = Path(target).name
-            if base.lower().endswith(".md"):
-                base = base[:-3]
-            candidates = stems.get(base.casefold(), [])
-            if candidates and not any(c in published for c in candidates):
-                line = f"WARN private link: {where} -> [[{target}]] (target is not opted in)"
-                if line not in warnings:
-                    warnings.append(line)
+        if audience == "private":
+            slug = slug_for(vault, p)
+            if slug:
+                claim(Path(slug), p)
+            else:
+                problems.append(f"{where}: cannot derive a slug from the path")
+        else:
+            claim(note_rel(vault, p), p)
+
+            for raw in WIKILINK.findall(text):
+                target = raw.strip()
+                if not target or Path(target).suffix.lower() in ATTACH_EXT:
+                    continue
+                base = Path(target).name
+                if base.lower().endswith(".md"):
+                    base = base[:-3]
+                candidates = stems.get(base.casefold(), [])
+                if candidates and not any(c in published for c in candidates):
+                    line = f"WARN private link: {where} -> [[{target}]] (target is not opted in)"
+                    if line not in warnings:
+                        warnings.append(line)
 
         for name in EMBED.findall(text):
             hits = attachments_by_name.get(Path(name.strip()).name, [])
@@ -239,6 +534,18 @@ def sync(vault: Path, content: Path, *, dry_run: bool = False, strict: bool = Fa
             for line in warnings:
                 print("  " + line, file=sys.stderr)
         return 2
+
+    if audience == "private":
+        assert db is not None
+        return _write_private(
+            vault,
+            published,
+            md_texts,
+            db=db.expanduser().resolve(),
+            dry_run=dry_run,
+            upload_url=upload_url,
+            import_key=import_key,
+        )
 
     wanted: set[Path] = set()
     for rel, src in sorted(outputs.items()):
@@ -272,13 +579,61 @@ def run(argv: list[str] | None = None) -> int:
     ap.add_argument("--vault", default=str(Path.home() / "vaults/polyhydra"))
     ap.add_argument("--content", default=str(DEFAULT_CONTENT), help="output directory (default: repo content/)")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--strict", action="store_true", help="abort on private-link warnings too")
+    ap.add_argument("--strict", action="store_true", help="abort on private-link warnings too (public only)")
+    ap.add_argument(
+        "--audience",
+        choices=AUDIENCES,
+        default="public",
+        help="public: mindblank: true -> content/ (default); private: mindblank: private -> runbook.db",
+    )
+    ap.add_argument("--db", metavar="PATH", help="private only: where to write runbook.db")
+    ap.add_argument("--upload", metavar="URL", help="private only: PUT the db to URL/api/import")
+    ap.add_argument(
+        "--key-file",
+        metavar="PATH",
+        help=f"private only, with --upload: file holding the import key (default: env {IMPORT_KEY_ENV})",
+    )
     args = ap.parse_args(argv)
+
+    vault = Path(args.vault).expanduser().resolve()
+
+    if args.audience == "public":
+        stray = [flag for flag, val in (("--db", args.db), ("--upload", args.upload), ("--key-file", args.key_file)) if val]
+        if stray:
+            print(f"error: {', '.join(stray)} only apply to --audience private", file=sys.stderr)
+            return 1
+        return sync(vault, Path(args.content), dry_run=args.dry_run, strict=args.strict)
+
+    if not args.db:
+        print("error: --audience private requires --db PATH", file=sys.stderr)
+        return 1
+    if args.key_file and not args.upload:
+        print("error: --key-file only applies with --upload", file=sys.stderr)
+        return 1
+
+    import_key: str | None = None
+    if args.upload:
+        if urllib.parse.urlsplit(args.upload).scheme not in ("http", "https"):
+            print("error: --upload must be an http or https URL", file=sys.stderr)
+            return 1
+        try:
+            import_key = load_import_key(args.key_file)
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"error: cannot read import key file {args.key_file}: {exc.__class__.__name__}", file=sys.stderr)
+            return 1
+        if not import_key:
+            print(f"error: no import key: set {IMPORT_KEY_ENV} or pass --key-file PATH", file=sys.stderr)
+            return 1
+
     return sync(
-        Path(args.vault).expanduser().resolve(),
+        vault,
         Path(args.content),
         dry_run=args.dry_run,
         strict=args.strict,
+        audience="private",
+        db=Path(args.db),
+        upload_url=args.upload,
+        import_key=import_key,
     )
 
 
