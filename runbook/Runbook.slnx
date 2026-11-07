@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Runbook/Runbook.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Runbook.Tests/Runbook.Tests.csproj" />
+  </Folder>
+</Solution>

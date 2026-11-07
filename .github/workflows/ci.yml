@@ -21,3 +21,14 @@ jobs:
       - run: npm ci
       - run: npx quartz build
       - run: python3 -I -m unittest discover -s tests
+
+  runbook-unit:
+    name: Runbook unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet test runbook/
