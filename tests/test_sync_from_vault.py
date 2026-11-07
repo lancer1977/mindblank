@@ -591,6 +591,54 @@ class PrivateArgumentTests(PrivateTestCase):
         self.assertFalse(self.db.exists())
 
 
+class CrlfAudienceTests(PrivateTestCase):
+    def both(self, eol: str) -> str:
+        return eol.join(["---", "mindblank: true", "mindblank: private", "---", ""]) + "body" + eol
+
+    def test_crlf_both_markers_is_private_only(self) -> None:
+        self.write("Gaming PC/Both.md", self.both("\r\n"))
+        self.assertEqual(sync.audience_of(self.both("\r\n")), "private")
+        code, _o, err = self.run_sync()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.content_files(), [], "never published publicly")
+        code, _o, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/both"])
+
+    def test_crlf_private_only_selected(self) -> None:
+        self.write("Gaming PC/P.md", "---\r\nmindblank: private   \r\n---\r\nbody\r\n")
+        code, _o, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/p"])
+
+    def test_cr_only_both_markers_is_private_only(self) -> None:
+        self.write("Gaming PC/Cr.md", self.both("\r"))
+        self.assertEqual(sync.audience_of(self.both("\r")), "private")
+        code, _o, err = self.run_sync()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.content_files(), [])
+        code, _o, err = self.run_private()
+        self.assertEqual(code, 0, msg=err)
+        self.assertEqual(self.db_slugs(), ["gaming-pc/cr"])
+
+    def test_trailing_whitespace_public_marker(self) -> None:
+        self.assertEqual(sync.audience_of("---\nmindblank: true \t\n---\nx\n"), "public")
+
+    def test_upload_refuses_plain_http_to_remote_host(self) -> None:
+        self.pnote("Gaming PC", "Priv", "body")
+        self.key_file.write_text(IMPORT_KEY + "\n", encoding="utf-8")
+        for url in ("http://example.com", "http://192.0.2.10:8080", "http://localhost.example.com"):
+            code, out, err = self.run_private("--upload", url, "--key-file", str(self.key_file))
+            self.assertEqual(code, 1, msg=url)
+            self.assertIn("https", err)
+            self.assertNotIn(IMPORT_KEY, out + err)
+        self.assertFalse(self.db.exists())
+
+    def test_upload_url_error_allows_loopback_and_https(self) -> None:
+        for url in ("http://localhost:1", "http://127.0.0.1:1", "http://[::1]:1", "https://example.com"):
+            self.assertIsNone(sync.upload_url_error(url), url)
+
+
 class _UploadServer:
     """Local http.server test double that records every request it receives."""
 

@@ -53,7 +53,7 @@ IMPORT_PATH = "/api/import"
 IMPORT_KEY_ENV = "RUNBOOK_IMPORT_KEY"
 
 FRONTMATTER = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.S)
-PUBLISH = re.compile(r"^mindblank:\s*(true|yes)\s*$", re.M | re.I)
+PUBLISH = re.compile(r"^mindblank:[ \t]*(true|yes)[ \t]*$", re.M | re.I)
 PRIVATE = re.compile(r"^mindblank:[ \t]*([\"']?)private\1[ \t]*$", re.M | re.I)
 QUARTZ_PUBLISH = re.compile(r"^publish:\s*true\s*$", re.M | re.I)
 EMBED = re.compile(r"!\[\[([^\]|#]+)")
@@ -149,12 +149,18 @@ SECRET_RULES = [
 ]
 
 
+def normalize_eol(text: str) -> str:
+    """CRLF and lone CR become LF so audience matching never depends on line endings."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def audience_of(text: str) -> str | None:
     """Which audience a note opts into, or None.
 
     Private is checked first, so a note carrying both markers can only be
     selected for private and never leaks into the public content/ tree.
     """
+    text = normalize_eol(text)
     m = FRONTMATTER.match(text)
     if not m:
         return None
@@ -294,6 +300,7 @@ class NoteRecord(NamedTuple):
 
 
 def build_record(vault: Path, p: Path, text: str) -> NoteRecord:
+    text = normalize_eol(text)
     fm = FRONTMATTER.match(text)
     fm_text = fm.group(1) if fm else ""
     body = note_body(text)
@@ -369,6 +376,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, *args, **kwargs):  # noqa: D401 - urllib hook
         return None
+
+
+LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def upload_url_error(url: str) -> str | None:
+    """Why --upload must refuse this URL, or None. Plain http only to loopback."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        return "--upload must be an http or https URL"
+    if parts.scheme == "http" and (parts.hostname or "").lower() not in LOOPBACK_HOSTS:
+        return "--upload refuses plain http:// to a non-loopback host; use https://"
+    return None
 
 
 def upload_db(db: Path, base_url: str, import_key: str) -> int:
@@ -613,8 +633,9 @@ def run(argv: list[str] | None = None) -> int:
 
     import_key: str | None = None
     if args.upload:
-        if urllib.parse.urlsplit(args.upload).scheme not in ("http", "https"):
-            print("error: --upload must be an http or https URL", file=sys.stderr)
+        url_err = upload_url_error(args.upload)
+        if url_err:
+            print(f"error: {url_err}", file=sys.stderr)
             return 1
         try:
             import_key = load_import_key(args.key_file)

@@ -12,3 +12,7 @@ replit.nix
 __pycache__/
 .build-check/
 .claude/
+runbook.db
+*.db
+*.db-journal
+*.db-wal
