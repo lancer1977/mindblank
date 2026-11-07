@@ -1,0 +1,7 @@
+schema_version: 1
+profile:
+  id: polyhydra-standard
+  version: 1
+standards:
+  testing: {version: 1, mode: warn}   # declared | warn | block
+overrides: {}
