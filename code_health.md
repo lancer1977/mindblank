@@ -105,9 +105,9 @@
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
 | recommended_next_slice   | F1+F6 prune guard: refuse to prune when 0 notes are selected but content/ has files, unless --allow-empty, plus a regression test |
 | owner                    | Opus orchestrates; a Haiku lane implements, on dev                                                                                |
-| follow_up_owner          | not specified in pass facts                                                                                                       |
+| follow_up_owner          | operator picks the next slice via picker                                                                                          |
 | next_revisit_date        | 2026-11-27                                                                                                                        |
-| next_work_picker_offered | not recorded in pass facts                                                                                                        |
+| next_work_picker_offered | yes, 2026-11-13                                                                                                                   |
 | next_work_picker_choice  | pending                                                                                                                           |
 
 Ranked next slices:
