@@ -466,6 +466,7 @@ def sync(
     db: Path | None = None,
     upload_url: str | None = None,
     import_key: str | None = None,
+    allow_empty: bool = False,
 ) -> int:
     if audience not in AUDIENCES:
         raise ValueError(f"unknown audience: {audience!r}")
@@ -567,6 +568,20 @@ def sync(
             import_key=import_key,
         )
 
+    if not outputs and not allow_empty and content.is_dir():
+        # Zero selected notes almost always means an unmounted or empty vault.
+        # Refuse rather than prune every published file (checked before any write).
+        stale_files = [
+            p for p in content.rglob("*") if p.is_file() and p.name not in KEEP
+        ]
+        if stale_files:
+            print(
+                f"error: 0 notes selected from {vault}; refusing to prune "
+                f"{len(stale_files)} file(s) in {content} (pass --allow-empty to override)",
+                file=sys.stderr,
+            )
+            return 2
+
     wanted: set[Path] = set()
     for rel, src in sorted(outputs.items()):
         dst = content / rel
@@ -601,6 +616,11 @@ def run(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--strict", action="store_true", help="abort on private-link warnings too (public only)")
     ap.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="public only: allow a run that selects 0 notes to prune content/",
+    )
+    ap.add_argument(
         "--audience",
         choices=AUDIENCES,
         default="public",
@@ -622,7 +642,13 @@ def run(argv: list[str] | None = None) -> int:
         if stray:
             print(f"error: {', '.join(stray)} only apply to --audience private", file=sys.stderr)
             return 1
-        return sync(vault, Path(args.content), dry_run=args.dry_run, strict=args.strict)
+        return sync(
+            vault,
+            Path(args.content),
+            dry_run=args.dry_run,
+            strict=args.strict,
+            allow_empty=args.allow_empty,
+        )
 
     if not args.db:
         print("error: --audience private requires --db PATH", file=sys.stderr)

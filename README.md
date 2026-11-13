@@ -9,6 +9,8 @@ agents (via Sage).
 2. `python3 -I scripts/sync-from-vault.py` copies **only** opted-in notes into
    `content/<folder-slug>/`, aborts if anything looks like a credential, and
    prunes notes that are no longer opted in. Use `--dry-run` to preview.
+   If a run selects zero notes (for example, an unmounted vault), it refuses to prune
+   a populated `content/` and exits 2; `--allow-empty` overrides this for a deliberate wipe.
 3. `npx quartz build`, then preview `public/` locally (or run `npx quartz build --serve`).
 4. Commit on `dev`. Publishing happens from `main`.
 

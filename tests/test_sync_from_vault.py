@@ -735,5 +735,46 @@ class PrivateUploadTests(PrivateTestCase):
         self.assertFalse(self.db.exists())
 
 
+class EmptySelectionTests(SyncTestCase):
+    """Issue #15: a run that selects 0 notes must not prune a populated content/."""
+
+    def seed_stale(self) -> Path:
+        self.note("Gaming PC", "Unmarked", "body", opted_in=False)
+        stale = self.content / "old" / "Note.md"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("stale", encoding="utf-8")
+        return stale
+
+    def test_zero_notes_refuses_to_prune(self) -> None:
+        stale = self.seed_stale()
+        before = stale.read_bytes()
+        code, _out, err = self.run_sync()
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to prune", err)
+        self.assertTrue(stale.is_file())
+        self.assertEqual(stale.read_bytes(), before)
+
+    def test_zero_notes_dry_run_refuses_and_leaves_file(self) -> None:
+        stale = self.seed_stale()
+        before = stale.read_bytes()
+        code, _out, err = self.run_sync("--dry-run")
+        self.assertEqual(code, 2)
+        self.assertIn("refusing to prune", err)
+        self.assertTrue(stale.is_file())
+        self.assertEqual(stale.read_bytes(), before)
+
+    def test_allow_empty_prunes(self) -> None:
+        stale = self.seed_stale()
+        code, _out, _err = self.run_sync("--allow-empty")
+        self.assertEqual(code, 0)
+        self.assertFalse(stale.exists())
+
+    def test_empty_vault_with_only_index_proceeds(self) -> None:
+        (self.content / "index.md").write_text("home", encoding="utf-8")
+        code, _out, _err = self.run_sync()
+        self.assertEqual(code, 0)
+        self.assertTrue((self.content / "index.md").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
