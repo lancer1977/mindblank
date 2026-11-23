@@ -28,11 +28,11 @@ Two things make a naive boot script fail silently: the target folders may not ex
 
 ## Fix
 
-Batocera runs executable scripts in `/userdata/system/services/` with `start` at boot and `stop` at shutdown. Save the script below as `/userdata/system/services/nas-mounts`, make it executable, and enable it:
+Batocera runs executable scripts in `/userdata/system/services/` with `start` at boot and `stop` at shutdown. Save the script below as `/userdata/system/services/nas_mounts`, make it executable, and enable it. The name matters: Batocera only accepts service names made of letters, digits and underscores, so a name with a hyphen (such as `nas-mounts`) is rejected by `batocera-services enable` and never runs at boot.
 
 ```bash
-chmod +x /userdata/system/services/nas-mounts
-batocera-services enable nas-mounts
+chmod +x /userdata/system/services/nas_mounts
+batocera-services enable nas_mounts
 batocera-services list
 ```
 
@@ -82,7 +82,7 @@ wait_for_nas() {
 case "$1" in
     start)
         if ! wait_for_nas; then
-            echo "nas-mounts: $NAS not reachable, nothing mounted"
+            echo "nas_mounts: $NAS not reachable, nothing mounted"
             exit 1
         fi
         for entry in $SHARES; do
@@ -91,7 +91,7 @@ case "$1" in
             mkdir -p "$dst"
             mountpoint -q "$dst" && continue
             mount -t cifs -o "$OPTS" "//${NAS}/Emulation/roms/${src}" "$dst" \
-                || echo "nas-mounts: failed to mount $src"
+                || echo "nas_mounts: failed to mount $src"
         done
         ;;
     stop)
@@ -121,4 +121,4 @@ exit 0
 2. Change `Emulation/roms` in the `mount` line if your NAS share path differs.
 3. Edit the `SHARES` list: one `nas-folder:batocera-folder` pair per line. Drop systems you do not have.
 4. Create the credentials file at the path given in `CREDS`. It needs `username=` and `password=` lines. Do not put those values in the script or in notes.
-5. Test without rebooting: `/userdata/system/services/nas-mounts start`, then `mount | grep cifs`.
+5. Test without rebooting: `/userdata/system/services/nas_mounts start`, then `mount | grep cifs`.

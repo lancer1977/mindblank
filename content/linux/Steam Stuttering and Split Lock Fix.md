@@ -54,12 +54,15 @@ cat /proc/sys/kernel/split_lock_mitigate
 It should print `0`.
 
 ### Alternative: disable detection entirely
-A different mechanism is the kernel command-line option `split_lock_detect=off`, which turns off split lock detection altogether (no log lines, no penalty). Add it to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then regenerate the GRUB config for your distro:
+A different mechanism is the kernel command-line option `split_lock_detect=off`, which turns off split lock detection altogether (no log lines, no penalty). How you add it depends on your distro:
 
-| Distro family | Command |
+| Distro family | How to add `split_lock_detect=off` |
 | --- | --- |
-| Debian, Ubuntu, Mint | `sudo update-grub` |
-| Arch, Fedora (BIOS or UEFI paths vary) | `sudo grub-mkconfig -o /boot/grub/grub.cfg` (Fedora: `/boot/grub2/grub.cfg`) |
+| Debian, Ubuntu, Mint | Add it to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then run `sudo update-grub` |
+| Arch | Add it to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`, then run `sudo grub-mkconfig -o /boot/grub/grub.cfg` |
+| Fedora | No file edit needed: `sudo grubby --args=split_lock_detect=off --update-kernel=ALL` |
+
+Fedora ships `grub2-mkconfig`, not `grub-mkconfig`, and recommends `grubby` for kernel arguments. `--update-kernel=ALL` applies to every installed kernel and to future ones. Check it with `sudo grubby --info=ALL | grep split_lock`.
 
 Then reboot. The sysctl approach above is the lighter option and is usually enough.
 
