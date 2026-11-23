@@ -3,5 +3,5 @@ profile:
   id: polyhydra-standard
   version: 1
 standards:
-  testing: {version: 1, mode: warn}   # declared | warn | block
+  testing: { version: 1, mode: warn } # declared | warn | block
 overrides: {}

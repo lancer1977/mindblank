@@ -12,12 +12,11 @@ If your main taskbar (panel) disappears after disconnecting a monitor or changin
 
 ## Quick Fixes
 
-### 1. Lock Panel to Primary Monitor
-The most robust fix is to tell Cinnamon to always put the panel on whichever monitor is currently designated as the **Primary** display, rather than a specific index number.
+### 1. Put the Panel Back on Monitor 0
+Cinnamon stores each panel as `panelID:monitor:position`, and the monitor field must be a monitor number. A name such as `primary` is not accepted: Cinnamon discards the definition and you are left with no panel. Monitor `0` is the one Cinnamon documents as primary, so point the panel there:
 
-Run this command:
 ```bash
-gsettings set org.cinnamon panels-enabled "['1:primary:bottom']"
+gsettings set org.cinnamon panels-enabled "['1:0:bottom']"
 ```
 
 ### 2. Restart Cinnamon (The "r" trick)
@@ -40,4 +39,4 @@ Cinnamon typically maps panels to monitor IDs (0, 1, 2). When a monitor is disco
 - `~/.config/cinnamon-monitors.xml` may contain an outdated layout.
 
 ## Prevention
-Ensure your main monitor is explicitly set as **Primary** in **Display Settings**. Use the `1:primary:bottom` setting mentioned above to ensure the panel follows that primary designation regardless of how many other screens are attached.
+Ensure your main monitor is explicitly set as **Primary** in **Display Settings**, and keep the panel on monitor `0` (`1:0:bottom`, which is also Cinnamon's default). If it goes missing again, the reset in fix 3 restores that default.

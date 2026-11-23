@@ -1,6 +1,20 @@
 # mindblank agent guide
 
+<!-- branching-policy:start version=1 -->
+
+## Branching and merge policy
+
+This block supersedes any conflicting branch guidance elsewhere in this file.
+
+- `dev` is the integration branch and the repository default. Branch from `dev` (`agent/<issue>-<slug>`) and open PRs with base `dev`.
+- Agents may merge their own PRs into `dev` once all of these hold: required CI checks are green on the PR head; the PR states its target branch, linked issue and the validation commands run; there are no unresolved review threads; the change stays within the issue's scope.
+- `main` is the release branch. **Only a human merges into `main`**, via a PR from `dev`. Agents may open the `dev` -> `main` PR but must not merge it, push to `main`, or force-push it.
+- Never force-push `dev`, never change branch protection or repository settings, never commit secrets.
+- If CI is red, fix the cause. Do not merge around a failing check or disable it.
+<!-- branching-policy:end -->
+
 <!-- devstudio-agent-policy:start schema=1 -->
+
 ## DevStudio Agent Policy
 
 Profile: `polyhydra-standard@1`.
@@ -22,6 +36,7 @@ These instructions are generated from `.devstudio/agent-policy.yaml`.
 <!-- devstudio-agent-policy:end -->
 
 <!-- std:testing:start version=1 -->
+
 ## Testing standard (testing@v1)
 
 - T1: a behavior change ships automated tests in the same PR.
