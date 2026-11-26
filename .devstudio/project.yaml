@@ -1,0 +1,32 @@
+schema_version: devstudio-project/v2
+name: mindblank
+repo_root: .
+github:
+  repository: lancer1977/mindblank
+portfolio:
+  lifecycle: active
+  family: mindblank
+  roles:
+    - documentation
+  domains:
+    - field-notes
+    - quartz
+    - obsidian
+related_repositories: []
+agent:
+  docs_entrypoint: README.md
+commands:
+  start:
+    - npx quartz build --serve
+  build:
+    - npx quartz build
+  test:
+    - python3 -I -m unittest discover -s tests
+  lint:
+    - npm run check
+languages:
+  - typescript
+  - python
+  - csharp
+frameworks:
+  - quartz

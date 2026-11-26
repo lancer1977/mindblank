@@ -16,3 +16,5 @@ runbook.db
 *.db
 *.db-journal
 *.db-wal
+.devstudio/runtime/
+/.worktrees/
