@@ -1,0 +1,41 @@
+schema_version: 3
+portfolio:
+  repository: lancer1977/mindblank
+  projects:
+    - id: mindblank
+      role: app
+  shape:
+    kind: app
+merge_policy:
+  integration_branch: dev
+  protected_branch: main
+  required_checks:
+    - Tier 1 build and unit tests
+    - Runbook unit tests
+  test_tiers:
+    unit:
+      command: python3 -I -m unittest discover -s tests && dotnet test runbook/
+      required_for: [dev]
+    integration:
+      command: "# Integration tests not yet implemented"
+      required_for: []
+    automation:
+      command: "npm ci && npx quartz build"
+      required_for: [dev]
+  escalate_paths:
+    - ".github/workflows/**"
+    - "**/*secret*"
+    - "**/*credential*"
+    - "**/*token*"
+    - "**/*deploy*"
+    - "runbook/Dockerfile"
+    - ".devstudio/**"
+    - ".mfd/**"
+  escalate_labels:
+    - decision
+    - security
+    - blocker
+  require_pr_tests: true
+  test_paths:
+    - "tests/**"
+    - "runbook/tests/**"
